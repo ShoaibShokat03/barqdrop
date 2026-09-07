@@ -1,0 +1,9 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
+assets/barqdrop.ico
+*.barqpart
+*.barqpart.json

@@ -1,0 +1,5 @@
+# BarqDrop runtime dependencies
+PySide6>=6.5,<7          # modern desktop UI
+cryptography>=41.0       # X25519 key agreement + AES-GCM (AES-NI accelerated)
+psutil>=5.9              # per-interface addresses, broadcast targets, link speed
+winsdk>=1.0.0b10; sys_platform == "win32"   # optional: Wi-Fi Direct / Mobile Hotspot

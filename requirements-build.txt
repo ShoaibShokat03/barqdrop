@@ -1,0 +1,2 @@
+# Extra tooling needed only to build the standalone Windows package
+pyinstaller>=6.3
