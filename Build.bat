@@ -58,6 +58,7 @@ echo.
 echo Running the engine self-test before packaging ...
 "%VPY%" tools\test_ranges.py || (echo Range checks failed - build aborted. & pause & exit /b 1)
 "%VPY%" tools\selftest.py 32  || (echo Transfer self-test failed - build aborted. & pause & exit /b 1)
+"%VPY%" tools\test_longtransfer.py 256 || (echo Long-transfer check failed - build aborted. & pause & exit /b 1)
 
 REM -------------------------------------------------------------------- icon
 echo.
@@ -79,7 +80,7 @@ if errorlevel 1 (echo PyInstaller failed. & pause & exit /b 1)
 if not exist "dist\BarqDrop\BarqDrop.exe" (echo Build produced no executable. & pause & exit /b 1)
 
 copy /y "installer\Install.bat" "dist\BarqDrop\Install.bat" >nul 2>&1
-copy /y "installer\Allow-Firewall.bat" "dist\BarqDrop\Allow-Firewall.bat" >nul 2>&1
+copy /y "Allow-Firewall.bat" "dist\BarqDrop\Allow-Firewall.bat" >nul 2>&1
 copy /y "README.md" "dist\BarqDrop\README.md" >nul 2>&1
 
 REM ---------------------------------------------------------- portable build

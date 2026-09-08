@@ -31,7 +31,8 @@ Other entry points:
 | `Run.bat` | Start BarqDrop |
 | `Run.bat --console` | Start it with a visible console for log output |
 | `Run.bat --check` | Prepare the environment and print the installed versions |
-| `Run.bat --test` | Run the range unit tests and the end-to-end transfer self-test |
+| `Run.bat --test` | Run the range unit tests and the end-to-end transfer self-tests |
+| `Run.bat --probe <ip>` | Diagnose why a device cannot be reached |
 | `Build.bat` | Build the standalone Windows package and installer |
 | `Build.bat --onefile` | Also emit a single portable `BarqDrop.exe` |
 
@@ -81,9 +82,39 @@ Discovery is a small UDP announcement on **45877**, sent both to every
 interface's broadcast address and to a multicast group, because some Wi-Fi
 drivers drop one but not the other. Transfers use TCP **45878**.
 
-If the two machines cannot see each other, it is almost always Windows
-Firewall: run `Allow-Firewall.bat` as administrator (the installer does this for
-you), and make sure the network is marked *Private*, not *Public*.
+---
+
+## When a send fails
+
+Run the built-in probe, pointing it at the IP shown on the device card:
+
+```bat
+Run.bat --probe 192.168.18.146
+```
+
+It walks the stack in order — local listener, firewall rules, network profile,
+TCP reachability, then the BarqDrop handshake — and names the layer that fails.
+
+**The usual cause is the receiving PC, not the sender.** Devices appear in each
+other's lists because discovery announcements are *outbound* UDP, which Windows
+always permits; the *inbound* TCP connection that carries the file is a
+different matter. So a device can be perfectly visible and still unreachable,
+which shows up as a transfer that fails with a connection timeout before the
+progress bar moves.
+
+Two things fix it, and both are needed — on the **receiving** machine:
+
+1. Right-click `Allow-Firewall.bat` → **Run as administrator**. It allows
+   `BarqDrop.exe` in a packaged install and `.venv\Scripts\pythonw.exe` in a
+   source checkout, plus the ports themselves.
+2. Set the network to **Private**. Windows blocks device-to-device traffic on
+   *Public* networks no matter what rules exist —
+   *Settings ▸ Network & Internet ▸ Wi-Fi ▸ your network ▸ Network profile type*.
+   `Allow-Firewall.bat` offers to switch it for you.
+
+A timeout that says *refused* rather than *timed out* means the opposite:
+the host answered but nothing is listening — BarqDrop is not running there, or
+the two sides are configured with different ports.
 
 ---
 
@@ -169,13 +200,15 @@ barqdrop/
     gui.py                the desktop UI
     theme.py              dark theme
     config.py, util.py    settings, identity, helpers
+  Allow-Firewall.bat      firewall rules + network profile (run as admin)
   installer/
     barqdrop.iss          Inno Setup script
     Install.bat           per-user install from the portable folder
-    Allow-Firewall.bat    firewall rules (run as administrator)
   tools/
     selftest.py           end-to-end transfer, resume, folder, decline tests
+    test_longtransfer.py  regression test for a long-idle control channel
     test_ranges.py        unit tests for the resume range arithmetic
+    probe.py              connectivity diagnosis
     test_gui.py           offscreen UI smoke test
     make_icon.py          renders assets/barqdrop.ico
 ```

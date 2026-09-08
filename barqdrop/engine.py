@@ -43,9 +43,46 @@ from .util import new_id, now, sanitize_relpath, unique_path
 CONNECT_TIMEOUT = 8.0
 OFFER_TIMEOUT = 300.0
 HANDSHAKE_TIMEOUT = 20.0
+RESULT_TIMEOUT = 600.0      # how long the sender waits for the final verdict
+STALL_TIMEOUT = 180.0       # abort a transfer that stops making progress
+POLL = 0.5
 MAX_STREAMS = 16
 RETRY_LIMIT = 6
 RETRY_BACKOFF = 0.6
+
+
+class TransferError(Exception):
+    """A failure with a message already written for the person reading it."""
+
+
+def connect_hint(peer, exc) -> str:
+    """Explain a failed TCP connect in terms the user can act on."""
+    where = "%s at %s:%s" % (peer.get("name") or "the other device",
+                             peer.get("ip"), peer.get("port"))
+    code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+    timed_out = isinstance(exc, socket.timeout) or code in (10060, 110)
+    refused = code in (10061, 111)
+    if refused:
+        return ("Could not reach %s - it refused the connection.\n"
+                "BarqDrop is probably not running there any more, or it is "
+                "listening on a different port (check Settings on both sides)." % where)
+    if timed_out:
+        return ("Could not reach %s - the connection timed out.\n"
+                "The device is announcing itself, so the network is fine; only the "
+                "transfer port is blocked. On the RECEIVING PC: run "
+                "Allow-Firewall.bat as administrator (or allow BarqDrop.exe / "
+                "pythonw.exe through Windows Defender Firewall for Private "
+                "networks), and set that network to Private, not Public." % where)
+    return "Could not reach %s - %s." % (where, exc)
+
+
+def handshake_hint(peer, exc) -> str:
+    where = peer.get("name") or peer.get("ip")
+    if isinstance(exc, socket.timeout):
+        return ("Connected to %s but it never answered the secure handshake.\n"
+                "Either it is running a different version of BarqDrop, or the app "
+                "was closed mid-connection." % where)
+    return "Handshake with %s failed - %s." % (where, exc)
 
 
 # --------------------------------------------------------------------- jobs
@@ -368,9 +405,25 @@ class Engine:
                 self.sessions.pop(token, None)
 
     def _receive_loop(self, link: ControlLink, session: Session, job: Job) -> None:
+        """Watch the control channel while the data streams do the work.
+
+        The channel is legitimately silent for the whole transfer, so this
+        polls for readability instead of relying on a socket timeout, and
+        judges liveness by whether bytes are still arriving.
+        """
+        last_bytes = job.done_bytes
+        last_move = now()
         try:
-            while True:
-                msg = link.recv(timeout=None)
+            while not self._stop.is_set():
+                if not protocol.wait_readable(link.sock, POLL):
+                    moved = job.done_bytes
+                    if moved != last_bytes:
+                        last_bytes, last_move = moved, now()
+                    elif now() - last_move > STALL_TIMEOUT:
+                        raise protocol.ProtocolError(
+                            "no data arrived for %d seconds" % STALL_TIMEOUT)
+                    continue
+                msg = link.recv(timeout=60.0)
                 kind = msg.get("t")
                 if kind == MSG_CANCEL:
                     session.cancel.set()
@@ -510,12 +563,18 @@ class Engine:
     def _send_worker(self, job: Job, peer: dict, items) -> None:
         link = None
         try:
-            sock = socket.create_connection((peer["ip"], int(peer["port"])), CONNECT_TIMEOUT)
+            try:
+                sock = socket.create_connection((peer["ip"], int(peer["port"])), CONNECT_TIMEOUT)
+            except OSError as exc:
+                raise TransferError(connect_hint(peer, exc)) from exc
             protocol.tune_socket(sock, self.config.sock_buf)
             sock.settimeout(HANDSHAKE_TIMEOUT)
-            protocol.greet(sock, ROLE_CONTROL)
-            keys, peer_pub = crypto.handshake_initiator(
-                sock, self.identity, protocol.send_all, protocol.recv_exact)
+            try:
+                protocol.greet(sock, ROLE_CONTROL)
+                keys, peer_pub = crypto.handshake_initiator(
+                    sock, self.identity, protocol.send_all, protocol.recv_exact)
+            except OSError as exc:
+                raise TransferError(handshake_hint(peer, exc)) from exc
             link = ControlLink(sock, crypto.Sealer(keys.c2s), crypto.Opener(keys.s2c))
             fp = crypto.fingerprint(peer_pub)
 
@@ -583,7 +642,12 @@ class Engine:
                 return
 
             link.send({"t": MSG_COMPLETE})
-            result = link.recv(timeout=120.0)
+            # Finalising many large files can take a while; wait patiently.
+            if not protocol.wait_readable(link.sock, RESULT_TIMEOUT):
+                raise TransferError(
+                    "All data was sent, but %s never confirmed it saved the files."
+                    % job.peer_name)
+            result = link.recv(timeout=60.0)
             if result.get("ok"):
                 job.state = "done"
             else:
@@ -592,7 +656,9 @@ class Engine:
         except Exception as exc:
             if job.state not in ("cancelled", "rejected"):
                 job.state = "failed"
-                job.error = str(exc)[:300]
+                # TransferError messages are already written for the user.
+                limit = 800 if isinstance(exc, TransferError) else 300
+                job.error = str(exc)[:limit]
         finally:
             job.finished = now()
             self._publish(job)

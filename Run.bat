@@ -5,6 +5,7 @@ REM     Run.bat            start the app
 REM     Run.bat --console  start it with a visible console (for logs)
 REM     Run.bat --check    only prepare the environment, then report
 REM     Run.bat --test     prepare, then run the engine self-test
+REM     Run.bat --probe IP diagnose why a device cannot be reached
 REM ===================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 title BarqDrop
@@ -74,6 +75,10 @@ if /i "%~1"=="--check" (
     echo.
     echo Environment is ready. Run.bat with no arguments starts BarqDrop.
     exit /b 0
+)
+if /i "%~1"=="--probe" (
+    "%VPY%" tools\probe.py %2 %3
+    exit /b %errorlevel%
 )
 if /i "%~1"=="--test" (
     "%VPY%" tools\test_ranges.py

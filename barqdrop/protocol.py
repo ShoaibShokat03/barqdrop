@@ -136,9 +136,14 @@ class ControlLink:
         self.sock.sendall(struct.pack("!I", len(blob)) + blob)
 
     def recv(self, timeout=None) -> dict:
+        """Read one message. `timeout=None` blocks until it arrives.
+
+        The timeout is always applied, never inherited: a socket that still
+        carried the handshake timeout would otherwise abort a long transfer
+        while the control channel is legitimately idle.
+        """
         old = self.sock.gettimeout()
-        if timeout is not None:
-            self.sock.settimeout(timeout)
+        self.sock.settimeout(timeout)
         try:
             (n,) = struct.unpack("!I", recv_exact(self.sock, 4))
             if n > MAX_CONTROL_MSG:
