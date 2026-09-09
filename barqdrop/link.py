@@ -19,6 +19,7 @@ join any common Wi-Fi/hotspot and BarqDrop discovers peers there just the same.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
 import subprocess
@@ -141,6 +142,53 @@ def describe_link() -> str:
     return "%s - %s - %d Mbps" % (label, where, link["mbps"])
 
 
+# ------------------------------------------------------------ WinRT helpers
+def _sync(op):
+    """Block on a WinRT async operation and return its result.
+
+    winsdk's IAsyncOperation / IAsyncAction are awaitable but expose no
+    blocking `get()`, so drive them on a private event loop. Works from any
+    thread that is not already running one.
+    """
+    getter = getattr(op, "get", None)
+    if callable(getter):        # some winsdk builds do provide it
+        return getter()
+
+    async def drive():
+        return await op
+
+    return asyncio.run(drive())
+
+
+def _status_name(status) -> str:
+    return getattr(status, "name", None) or str(status)
+
+
+def _tethering_capability(profile) -> str:
+    """Empty string when tethering is allowed, else why it is not."""
+    try:
+        from winsdk.windows.networking.networkoperators import (
+            NetworkOperatorTetheringManager,
+            TetheringCapability,
+        )
+    except Exception:
+        return ""
+    try:
+        capability = NetworkOperatorTetheringManager.get_tethering_capability(profile)
+    except Exception:
+        return ""      # older builds lack the query; let the real attempt decide
+    if capability == TetheringCapability.ENABLED:
+        return ""
+    return {
+        "DISABLED_BY_GROUP_POLICY": "blocked by group policy",
+        "DISABLED_BY_HARDWARE_LIMITATION": "the Wi-Fi adapter cannot host a network",
+        "DISABLED_BY_OPERATOR": "disabled by the network operator",
+        "DISABLED_BY_REQUIRED_APP_NOT_INSTALLED": "a required Windows component is missing",
+        "DISABLED_BY_SKU": "not supported by this Windows edition",
+        "DISABLED_BY_SYSTEM_CAPABILITY": "the system does not allow it",
+    }.get(_status_name(capability), _status_name(capability))
+
+
 # ----------------------------------------------------------- direct linking
 class DirectLink:
     """Creates a router-free device-to-device Wi-Fi link when possible."""
@@ -213,16 +261,23 @@ class DirectLink:
                 profile = profiles[0] if profiles else None
             if profile is None:
                 return False, "- Mobile Hotspot needs an active network adapter to share."
+
+            capability = _tethering_capability(profile)
+            if capability:
+                return False, "- Mobile Hotspot is unavailable: %s." % capability
+
             manager = NetworkOperatorTetheringManager.create_from_connection_profile(profile)
             config = manager.get_current_access_point_configuration()
             config.ssid = self.ssid
             config.passphrase = self.passphrase
-            manager.configure_access_point_async(config).get()
+            _sync(manager.configure_access_point_async(config))
             if manager.tethering_operational_state == TetheringOperationalState.ON:
-                manager.stop_tethering_async().get()
-            result = manager.start_tethering_async().get()
-            if result.status != TetheringOperationStatus.SUCCESS:
-                return False, "- Mobile Hotspot refused to start (status %s)." % result.status
+                _sync(manager.stop_tethering_async())
+            result = _sync(manager.start_tethering_async())
+            status = getattr(result, "status", result)
+            if status != TetheringOperationStatus.SUCCESS:
+                return False, ("- Mobile Hotspot refused to start (%s)."
+                               % _status_name(status))
             self._tethering = manager
             self.active = True
             self.method = "Windows Mobile Hotspot (Wi-Fi Direct soft AP)"
@@ -252,7 +307,7 @@ class DirectLink:
         messages = []
         if self._tethering is not None:
             try:
-                self._tethering.stop_tethering_async().get()
+                _sync(self._tethering.stop_tethering_async())
                 messages.append("Mobile Hotspot stopped.")
             except Exception as exc:
                 messages.append("Could not stop Mobile Hotspot: %s" % exc)
