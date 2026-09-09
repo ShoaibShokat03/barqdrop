@@ -83,6 +83,8 @@ if /i "%~1"=="--probe" (
 if /i "%~1"=="--test" (
     "%VPY%" tools\test_ranges.py
     "%VPY%" tools\selftest.py 64
+    "%VPY%" tools\test_longtransfer.py 256
+    "%VPY%" tools\test_directlink.py
     exit /b %errorlevel%
 )
 if /i "%~1"=="--console" (

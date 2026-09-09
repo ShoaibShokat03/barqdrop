@@ -17,8 +17,9 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .config import Config
+from .directflow import DirectLinkFlow, InviteDialog
 from .engine import Engine, build_items
-from .link import DirectLink, cached_link_description
+from .link import cached_link_description
 from .util import human_eta, human_rate, human_size, primary_ip, resource_path
 
 APP_TITLE = "BarqDrop"
@@ -72,12 +73,14 @@ def _head(text: str) -> QLabel:
 class DeviceCard(QFrame):
     """One discovered peer; also a drop target for files."""
 
-    def __init__(self, peer: dict, on_send, on_drop, on_speedtest=None):
+    def __init__(self, peer: dict, on_send, on_drop, on_speedtest=None,
+                 on_direct=None):
         super().__init__()
         self.peer = peer
         self.on_send = on_send
         self.on_drop = on_drop
         self.on_speedtest = on_speedtest
+        self.on_direct = on_direct
         self.setObjectName("Panel")
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -106,6 +109,16 @@ class DeviceCard(QFrame):
         col.addWidget(name)
         col.addWidget(sub)
         row.addLayout(col, 1)
+
+        if self.on_direct is not None:
+            self.direct_btn = QPushButton("Direct")
+            self.direct_btn.setObjectName("Ghost")
+            self.direct_btn.setCursor(Qt.PointingHandCursor)
+            self.direct_btn.setToolTip(
+                "Put both machines on a private Wi-Fi link to each other,\n"
+                "measure it, and offer to switch back if it is not faster.")
+            self.direct_btn.clicked.connect(lambda: self.on_direct(self.peer))
+            row.addWidget(self.direct_btn)
 
         if self.on_speedtest is not None:
             self.speed_btn = QPushButton("Speed")
@@ -455,11 +468,12 @@ class MainWindow(QMainWindow):
         self.config = config
         self.engine = engine
         self.events = events
-        self.direct = DirectLink()
         self.staged: list[str] = []
         self._pumping = False
         self.rows: dict[str, TransferRow] = {}
+        self.job_state: dict[str, dict] = {}
         self.open_offers: dict[str, OfferDialog] = {}
+        self.open_invites: dict[str, InviteDialog] = {}
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(app_icon())
@@ -478,6 +492,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_devices()
         self._refresh_status()
+        self._update_direct_button()
 
     # ----------------------------------------------------------- layout
     def _build(self) -> None:
@@ -519,6 +534,8 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
 
         self.direct_btn = QPushButton("Start direct Wi-Fi link")
+        self.direct_btn.setToolTip(
+            "Host a private Wi-Fi link from this PC, or undo one that is active.")
         self.direct_btn.clicked.connect(self._toggle_direct)
         lay.addWidget(self.direct_btn)
 
@@ -670,6 +687,18 @@ class MainWindow(QMainWindow):
     def _speed_test(self, peer: dict) -> None:
         self.engine.speed_test(peer, SPEEDTEST_MB)
 
+    def _direct_link(self, peer: dict) -> None:
+        DirectLinkFlow(self, self.engine, peer).run()
+
+    # -- hooks used by DirectLinkFlow, which runs its own nested loop -----
+    def pump_events(self) -> None:
+        """Keep the UI alive and job state fresh during a blocking flow."""
+        self._drain_once()
+        QApplication.processEvents()
+
+    def last_job(self, job_id: str):
+        return self.job_state.get(job_id)
+
     # ------------------------------------------------------------ devices
     def _refresh_devices(self) -> None:
         peers = self.engine.discovery.snapshot()
@@ -685,33 +714,43 @@ class MainWindow(QMainWindow):
             return
         for i, peer in enumerate(peers):
             card = DeviceCard(peer, self._send_to, self._drop_on_device,
-                              self._speed_test)
+                              self._speed_test, self._direct_link)
             self.device_lay.insertWidget(i, card)
 
     # ------------------------------------------------------------- status
     def _refresh_status(self) -> None:
         bits = ["%s  -  %s" % (self.config["device_name"], primary_ip())]
         bits.append(cached_link_description())
-        if self.direct.active:
-            bits.append("direct link: %s" % self.direct.ssid)
+        if self.engine.direct.active:
+            bits.append("hosting direct link: %s" % self.engine.direct.ssid)
+        elif self.config.get("previous_ssid"):
+            bits.append("on a direct link")
         if self.engine.listen_error:
             bits.append("PORT ERROR: %s" % self.engine.listen_error)
         self.status.setText("   |   ".join(bits))
 
     def _toggle_direct(self) -> None:
-        if self.direct.active:
-            ok, msg = self.direct.stop()
-            self.direct_btn.setText("Start direct Wi-Fi link")
-            QMessageBox.information(self, APP_TITLE, msg)
+        """Header button: host a link manually, or undo whatever is in place."""
+        on_link = self.engine.direct.active or bool(self.config.get("previous_ssid"))
+        self.direct_btn.setEnabled(False)
+        self.direct_btn.setText("Restoring..." if on_link else "Starting...")
+        QApplication.processEvents()
+        if on_link:
+            ok, msg = self.engine.restore_network()
         else:
-            self.direct_btn.setEnabled(False)
-            self.direct_btn.setText("Starting...")
-            QApplication.processEvents()
-            ok, msg = self.direct.start()
-            self.direct_btn.setEnabled(True)
-            self.direct_btn.setText("Stop direct Wi-Fi link" if ok else "Start direct Wi-Fi link")
-            (QMessageBox.information if ok else QMessageBox.warning)(self, APP_TITLE, msg)
+            ok, msg = self.engine.direct.start()
+            if ok:
+                msg += ("\n\nTo put a paired device on it automatically, use "
+                        "the Direct button on its card instead.")
+        self.direct_btn.setEnabled(True)
+        self._update_direct_button()
+        (QMessageBox.information if ok else QMessageBox.warning)(self, APP_TITLE, msg)
         self._refresh_status()
+
+    def _update_direct_button(self) -> None:
+        on_link = self.engine.direct.active or bool(self.config.get("previous_ssid"))
+        self.direct_btn.setText("Restore network" if on_link
+                                else "Start direct Wi-Fi link")
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.config, self)
@@ -751,6 +790,15 @@ class MainWindow(QMainWindow):
             dlg = self.open_offers.pop(event["id"], None)
             if dlg:
                 dlg.done(QDialog.Rejected)
+        elif kind == "link_invite":
+            self._on_link_invite(event["invite"])
+        elif kind == "link_invite_closed":
+            dlg = self.open_invites.pop(event["id"], None)
+            if dlg:
+                dlg.done(QDialog.Rejected)
+        elif kind == "link_joined":
+            self.statusBar().showMessage(event["message"], 12000)
+            self._refresh_status()
         elif kind == "jobs_cleared":
             for row in list(self.rows.values()):
                 row.setParent(None)
@@ -764,6 +812,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(event["text"], 6000)
 
     def _on_job(self, job: dict) -> None:
+        self.job_state[job["id"]] = job
         row = self.rows.get(job["id"])
         if row is None:
             row = TransferRow(job, self.engine.cancel_job)
@@ -772,6 +821,15 @@ class MainWindow(QMainWindow):
             self.no_transfers.setVisible(False)
         else:
             row.update_job(job)
+
+    def _on_link_invite(self, invite: dict) -> None:
+        dlg = InviteDialog(invite, self)
+        self.open_invites[invite["id"]] = dlg
+        self.raise_()
+        self.activateWindow()
+        accepted = dlg.exec() == QDialog.Accepted
+        self.open_invites.pop(invite["id"], None)
+        self.engine.respond_link_invite(invite["id"], accepted)
 
     def _on_offer(self, offer: dict) -> None:
         dlg = OfferDialog(offer, self)

@@ -45,6 +45,8 @@ MSG_COMPLETE = "complete"
 MSG_RESULT = "result"
 MSG_CANCEL = "cancel"
 MSG_PING = "ping"
+MSG_LINK = "link"               # "join my direct Wi-Fi link"
+MSG_LINK_RESULT = "link_result"
 
 
 class ProtocolError(Exception):

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication          # noqa: E402
 from barqdrop.config import Config                  # noqa: E402
 from barqdrop.engine import Engine                  # noqa: E402
 from barqdrop.gui import MainWindow, OfferDialog, SettingsDialog  # noqa: E402
+from barqdrop.directflow import BusyDialog, InviteDialog  # noqa: E402
 
 
 def main():
@@ -63,6 +64,19 @@ def main():
                        "trusted": False}, win)
     dlg.resize(430, 470)
     dlg.grab().save(os.path.join(out, "screenshot-offer.png"))
+
+    inv = InviteDialog({"id": "i1", "peer": "Office-Tower",
+                        "ssid": "BarqDrop-AE32", "from_ssid": "JTech2-5Ghz"}, win)
+    inv.resize(450, 320)
+    inv.grab().save(os.path.join(out, "screenshot-invite.png"))
+
+    busy = BusyDialog("Direct Wi-Fi link", "Measuring the current link...", win)
+    busy.resize(430, 180)
+    busy.grab().save(os.path.join(out, "screenshot-busy.png"))
+
+    # the direct-link flow reads job results through these hooks
+    assert win.last_job("j1") is not None, "job_state did not record a job"
+    win.pump_events()
 
     sett = SettingsDialog(cfg, win)
     sett.resize(480, 560)

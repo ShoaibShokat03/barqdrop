@@ -20,6 +20,7 @@ join any common Wi-Fi/hotspot and BarqDrop discovers peers there just the same.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
 import subprocess
@@ -318,3 +319,99 @@ class DirectLink:
         self.active = False
         self.ssid = self.passphrase = self.method = ""
         return True, " ".join(messages) or "Direct link stopped."
+
+
+# ------------------------------------------------- joining a network by name
+PROFILE_TEMPLATE = """<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>%(ssid)s</name>
+  <SSIDConfig><SSID><name>%(ssid)s</name></SSID></SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>manual</connectionMode>
+  <MSM>
+    <security>
+      <authEncryption>
+        <authentication>WPA2PSK</authentication>
+        <encryption>AES</encryption>
+        <useOneX>false</useOneX>
+      </authEncryption>
+      <sharedKey>
+        <keyType>passPhrase</keyType>
+        <protected>false</protected>
+        <keyMaterial>%(key)s</keyMaterial>
+      </sharedKey>
+    </security>
+  </MSM>
+</WLANProfile>
+"""
+
+
+def profile_xml(ssid: str, passphrase: str) -> str:
+    """A WPA2-PSK profile Windows will accept from `netsh wlan add profile`."""
+    from xml.sax.saxutils import escape
+
+    return PROFILE_TEMPLATE % {"ssid": escape(ssid), "key": escape(passphrase)}
+
+
+def current_ssid() -> str:
+    return wifi_status().get("ssid", "")
+
+
+def add_profile(ssid: str, passphrase: str) -> tuple[bool, str]:
+    """Register a network so Windows can connect to it by name."""
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), "barqdrop-%s.xml" % secrets.token_hex(4))
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(profile_xml(ssid, passphrase))
+        code, out, err = _run(["netsh", "wlan", "add", "profile",
+                               "filename=%s" % path, "user=current"])
+        if code != 0:
+            return False, (err or out).strip() or "netsh rejected the profile"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def forget_profile(ssid: str) -> None:
+    _run(["netsh", "wlan", "delete", "profile", "name=%s" % ssid])
+
+
+def join_network(ssid: str, passphrase: str, timeout: float = 30.0) -> tuple[bool, str]:
+    """Switch this machine's Wi-Fi to `ssid`. Blocks until it is up."""
+    ok, why = add_profile(ssid, passphrase)
+    if not ok:
+        return False, "Could not register the network profile: %s" % why
+    code, out, err = _run(["netsh", "wlan", "connect", "name=%s" % ssid,
+                           "ssid=%s" % ssid])
+    if code != 0:
+        return False, "netsh could not start the connection: %s" % (err or out).strip()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = wifi_status()
+        if status["connected"] and status["ssid"] == ssid:
+            return True, "Connected to %s" % ssid
+        time.sleep(1.0)
+    return False, "Joined nothing within %ds - %s may be out of range" % (timeout, ssid)
+
+
+def rejoin_network(ssid: str, timeout: float = 30.0) -> tuple[bool, str]:
+    """Reconnect to a network Windows already has a profile for."""
+    if not ssid:
+        return False, "No previous network was recorded."
+    code, out, err = _run(["netsh", "wlan", "connect", "name=%s" % ssid])
+    if code != 0:
+        return False, (err or out).strip() or "netsh refused the reconnect"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = wifi_status()
+        if status["connected"] and status["ssid"] == ssid:
+            return True, "Back on %s" % ssid
+        time.sleep(1.0)
+    return False, "Did not rejoin %s within %ds" % (ssid, timeout)

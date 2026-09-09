@@ -24,6 +24,7 @@ from collections import deque
 
 from . import crypto, protocol
 from .discovery import Discovery
+from .link import DirectLink, current_ssid, join_network, rejoin_network
 from .protocol import (
     DataLink,
     ControlLink,
@@ -32,6 +33,8 @@ from .protocol import (
     MSG_CANCEL,
     MSG_COMPLETE,
     MSG_DECISION,
+    MSG_LINK,
+    MSG_LINK_RESULT,
     MSG_OFFER,
     MSG_RESULT,
     ROLE_CONTROL,
@@ -216,6 +219,18 @@ class Offer:
         self.remember = True
 
 
+class LinkInvite:
+    """A paired device asking this machine to move onto a direct Wi-Fi link."""
+
+    def __init__(self, peer_name, ssid, from_ssid):
+        self.id = new_id()[:12]
+        self.peer_name = peer_name
+        self.ssid = ssid
+        self.from_ssid = from_ssid
+        self.decided = threading.Event()
+        self.accepted = False
+
+
 class Session:
     """Receiver-side state shared between the control link and data links."""
 
@@ -243,8 +258,10 @@ class Engine:
         self.discovery = Discovery(config, self.fingerprint,
                                    on_change=lambda: self.emit({"type": "peers"}),
                                    on_log=self.log)
+        self.direct = DirectLink()
         self.jobs: dict[str, Job] = {}
         self.offers: dict[str, Offer] = {}
+        self.invites: dict[str, LinkInvite] = {}
         self.sessions: dict[bytes, Session] = {}
         self._jobs_lock = threading.Lock()
         self._sessions_lock = threading.Lock()
@@ -361,6 +378,9 @@ class Engine:
         trusted = self.config.is_trusted(fp)
 
         msg = link.recv(timeout=30.0)
+        if msg.get("t") == MSG_LINK:
+            self._handle_link_invite(link, msg, addr, fp, trusted)
+            return
         if msg.get("t") != MSG_OFFER:
             raise protocol.ProtocolError("expected an offer")
 
@@ -581,6 +601,123 @@ class Engine:
                     pass
             with session.lock:
                 session.streams -= 1
+
+    # --------------------------------------------------- direct link (peer)
+    def _handle_link_invite(self, link, msg, addr, fingerprint, trusted) -> None:
+        """A peer asks this machine to hop onto its direct Wi-Fi link.
+
+        Changing which network someone's computer is on is not something a
+        message from the network gets to decide, so this needs BOTH a prior
+        pairing and an explicit yes from whoever is sitting here.
+        """
+        peer_name = str(msg.get("device") or addr[0])[:64]
+        ssid = str(msg.get("ssid") or "")[:64]
+        passphrase = str(msg.get("pass") or "")[:128]
+        if not trusted:
+            link.send({"t": MSG_LINK_RESULT, "ok": False,
+                       "reason": "this device is not paired with me yet - send a "
+                                 "file first so we can verify the pairing code"})
+            return
+        if not ssid or not passphrase:
+            link.send({"t": MSG_LINK_RESULT, "ok": False,
+                       "reason": "the invitation was incomplete"})
+            return
+
+        from_ssid = current_ssid()
+        invite = LinkInvite(peer_name, ssid, from_ssid)
+        self.invites[invite.id] = invite
+        self.emit({"type": "link_invite", "invite": {
+            "id": invite.id, "peer": peer_name, "ssid": ssid,
+            "from_ssid": from_ssid}})
+        try:
+            decided = invite.decided.wait(120.0)
+        finally:
+            self.invites.pop(invite.id, None)
+            self.emit({"type": "link_invite_closed", "id": invite.id})
+        if not decided or not invite.accepted:
+            link.send({"t": MSG_LINK_RESULT, "ok": False,
+                       "reason": "the other machine declined to switch networks"})
+            return
+
+        # Answer before switching: joining the new network drops this socket.
+        link.send({"t": MSG_LINK_RESULT, "ok": True, "switching": True})
+        threading.Thread(target=self._join_direct, args=(ssid, passphrase, from_ssid),
+                         name="join-direct", daemon=True).start()
+
+    def _join_direct(self, ssid, passphrase, from_ssid) -> None:
+        time.sleep(0.3)                      # let the reply reach the peer
+        self.config["previous_ssid"] = from_ssid
+        self.config.save()
+        ok, message = join_network(ssid, passphrase)
+        self.emit({"type": "link_joined", "ok": ok, "ssid": ssid,
+                   "from_ssid": from_ssid, "message": message})
+        self.log(message)
+
+    def respond_link_invite(self, invite_id: str, accept: bool) -> None:
+        invite = self.invites.get(invite_id)
+        if invite:
+            invite.accepted = accept
+            invite.decided.set()
+
+    def invite_direct_link(self, peer: dict):
+        """Host a direct link and ask `peer` to join it. Blocking."""
+        if not self.direct.active:
+            ok, message = self.direct.start()
+            if not ok:
+                return False, message
+        payload = {"t": MSG_LINK, "device": self.config["device_name"],
+                   "ssid": self.direct.ssid, "pass": self.direct.passphrase}
+        try:
+            sock = socket.create_connection((peer["ip"], int(peer["port"])), CONNECT_TIMEOUT)
+        except OSError as exc:
+            return False, connect_hint(peer, exc)
+        link = None
+        try:
+            protocol.tune_socket(sock, self.config.sock_buf)
+            sock.settimeout(HANDSHAKE_TIMEOUT)
+            protocol.greet(sock, ROLE_CONTROL)
+            keys, peer_pub = crypto.handshake_initiator(
+                sock, self.identity, protocol.send_all, protocol.recv_exact)
+            fp = crypto.fingerprint(peer_pub)
+            if not self.config.is_trusted(fp):
+                return False, ("%s is not paired with this device yet. Send it a "
+                               "file first and verify the code, then try again."
+                               % (peer.get("name") or peer.get("ip")))
+            link = ControlLink(sock, crypto.Sealer(keys.c2s), crypto.Opener(keys.s2c))
+            link.send(payload)
+            reply = link.recv(timeout=150.0)
+            if not reply.get("ok"):
+                return False, str(reply.get("reason") or "the other device declined")
+            return True, ("%s is switching to %s now.\n\nBoth devices will "
+                          "reappear in the list once they are on the direct link."
+                          % (peer.get("name") or peer.get("ip"), self.direct.ssid))
+        except Exception as exc:
+            return False, "Could not set up the direct link: %s" % exc
+        finally:
+            if link is not None:
+                link.close()
+            else:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def restore_network(self):
+        """Undo a direct link: stop hosting, or rejoin the previous network."""
+        messages = []
+        if self.direct.active:
+            _, message = self.direct.stop()
+            messages.append(message)
+        previous = self.config.get("previous_ssid") or ""
+        if previous and current_ssid() != previous:
+            ok, message = rejoin_network(previous)
+            messages.append(message)
+            if ok:
+                self.config["previous_ssid"] = ""
+                self.config.save()
+        if not messages:
+            messages.append("Nothing to restore - this machine is on its usual network.")
+        return True, " ".join(messages)
 
     # -------------------------------------------------------- offer replies
     def respond_offer(self, offer_id: str, accept: bool, remember: bool = True) -> None:

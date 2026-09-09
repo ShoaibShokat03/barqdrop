@@ -59,6 +59,7 @@ echo Running the engine self-test before packaging ...
 "%VPY%" tools\test_ranges.py || (echo Range checks failed - build aborted. & pause & exit /b 1)
 "%VPY%" tools\selftest.py 32  || (echo Transfer self-test failed - build aborted. & pause & exit /b 1)
 "%VPY%" tools\test_longtransfer.py 256 || (echo Long-transfer check failed - build aborted. & pause & exit /b 1)
+"%VPY%" tools\test_directlink.py || (echo Direct-link checks failed - build aborted. & pause & exit /b 1)
 
 REM -------------------------------------------------------------------- icon
 echo.

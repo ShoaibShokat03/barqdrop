@@ -26,6 +26,7 @@ DEFAULTS = {
     "prefer_wifi_direct": True,
     "trusted": {},              # fingerprint -> {"name":...}
     "identity_key": "",         # hex X25519 private key
+    "previous_ssid": "",        # network to rejoin after a direct link
 }
 
 

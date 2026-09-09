@@ -166,9 +166,23 @@ transfer, in descending order of impact:
 
 **1. Wi-Fi through a router costs you half.** Every byte crosses the air twice:
 sender → access point → receiver. Two devices on the same AP therefore share
-the airtime, and a 400 Mbps link yields around 100 Mbps of file transfer. Use
-**Start direct Wi-Fi link**, which connects the machines to each other, and the
-air is crossed once.
+the airtime, and a 400 Mbps link yields around 100 Mbps of file transfer.
+
+Press **Direct** on a device card to try removing that hop. One PC hosts a
+private Wi-Fi link and the other is asked — over the connection they already
+share — to join it, so neither of you types an SSID or a password.
+
+Whether it actually helps is hardware-dependent, and BarqDrop does not pretend
+otherwise: a laptop with a single radio has to share airtime between hosting
+the link and staying online, and Windows often narrows the soft AP's channel.
+So the flow **measures the link before switching, measures it again after, and
+shows you both numbers** with a one-click way back. If it is slower, take the
+way back.
+
+Two guardrails, because moving a machine onto a different network is not a
+small thing to do to someone: only a device you have already paired with can
+ask, and the machine being asked always gets a prompt naming the network it
+would join. **Restore network** in the header undoes it from either side.
 
 **2. Gigabit Ethernet is the only reliable way to actually reach 1 Gbit.** Wire
 both machines and expect ~110 MB/s — no radio, no relay, no contention.
@@ -243,6 +257,7 @@ barqdrop/
     discovery.py          UDP broadcast + multicast peer discovery
     resume.py             partial files and byte-range bookkeeping
     link.py               link speed reporting, Wi-Fi Direct / hotspot
+    directflow.py         measure -> switch -> re-measure -> keep or revert
     gui.py                the desktop UI
     theme.py              dark theme
     config.py, util.py    settings, identity, helpers
@@ -253,6 +268,7 @@ barqdrop/
   tools/
     selftest.py           end-to-end transfer, resume, folder, decline tests
     test_longtransfer.py  regression test for a long-idle control channel
+    test_directlink.py    direct-link invite flow, incl. who may ask
     test_ranges.py        unit tests for the resume range arithmetic
     bench.py              per-stage throughput benchmark
     probe.py              connectivity diagnosis
