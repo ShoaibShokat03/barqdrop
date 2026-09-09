@@ -130,12 +130,58 @@ the two sides are configured with different ports.
 | **Hardware-accelerated AES-GCM** | Encryption rides on AES-NI. It can also be switched off in Settings when the link is already trusted. |
 | **No compression, no re-encoding** | Bytes go from disk to socket to disk unchanged. |
 
-On loopback the engine sustains **~150-210 MB/s** with 4 streams; on a real
-network the link is the limit — expect roughly 110 MB/s on gigabit Ethernet and
-40-160 MB/s on Wi-Fi 5/6, which is where a transfer should be.
+### Measured ceiling
+
+`python tools/bench.py` times each stage in isolation, and the built-in speed
+test measures the engine end to end with no disk involved. On one ordinary
+laptop, running **both** endpoints in a single process (so each side gets half
+of one CPU):
+
+| Path | Throughput |
+| --- | --- |
+| AES-GCM encrypt / decrypt | ~900 MB/s |
+| Raw TCP, no framing | ~1.0 GB/s |
+| Framing layer, plain | ~630 MB/s |
+| Framing layer, encrypted | ~277 MB/s |
+| **Full engine, encrypted** | **375-400 MB/s  (3.1 Gbit/s)** |
+| **Full engine, plain** | **600-800 MB/s  (6.4 Gbit/s)** |
+
+A gigabit link needs 125 MB/s, so the engine clears it roughly three times over
+with encryption on. In practice **the network is always the limit, not
+BarqDrop** — which is what the speed test is for.
 
 Tuning lives in **Settings**: stream count, chunk size, segment size, socket
 buffer size, and payload encryption.
+
+---
+
+## Getting the most speed out of a link
+
+Press **Speed** on a device card. It sends generated data that is discarded on
+arrival — nothing touches either disk — so the number you get is the link
+itself, with the app's overhead already included.
+
+If that number disappoints, the fix is physical. What actually limits a
+transfer, in descending order of impact:
+
+**1. Wi-Fi through a router costs you half.** Every byte crosses the air twice:
+sender → access point → receiver. Two devices on the same AP therefore share
+the airtime, and a 400 Mbps link yields around 100 Mbps of file transfer. Use
+**Start direct Wi-Fi link**, which connects the machines to each other, and the
+air is crossed once.
+
+**2. Gigabit Ethernet is the only reliable way to actually reach 1 Gbit.** Wire
+both machines and expect ~110 MB/s — no radio, no relay, no contention.
+
+**3. Channel width matters more than the standard.** A 2x2 client at 80 MHz
+gets 867 Mbps; the same client at 40 MHz gets 400. If `netsh wlan show
+interfaces` reports a transmit rate near 400 Mbps on 5 GHz, the router is
+almost certainly set to 40 MHz — widen it to 80 MHz in the router's 5 GHz
+settings.
+
+**4. Turn off payload encryption** (Settings) only once the link is fast enough
+for it to matter. It is worth roughly 2x at multi-gigabit speeds and nothing
+at all below ~250 MB/s, and it costs you the integrity check.
 
 ---
 
@@ -208,6 +254,7 @@ barqdrop/
     selftest.py           end-to-end transfer, resume, folder, decline tests
     test_longtransfer.py  regression test for a long-idle control channel
     test_ranges.py        unit tests for the resume range arithmetic
+    bench.py              per-stage throughput benchmark
     probe.py              connectivity diagnosis
     test_gui.py           offscreen UI smoke test
     make_icon.py          renders assets/barqdrop.ico

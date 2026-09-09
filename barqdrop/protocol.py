@@ -36,6 +36,7 @@ KIND_END = b"E"
 
 MAX_CONTROL_MSG = 8 * 1024 * 1024
 MAX_RECORD = 64 * 1024 * 1024
+TAG_SLACK = 64          # room for the AES-GCM tag on top of a full chunk
 
 # control message types
 MSG_OFFER = "offer"
@@ -182,16 +183,34 @@ class DataLink:
         self.encrypted = sealer is not None or opener is not None
         self._buf = bytearray(chunk)
         self._view = memoryview(self._buf)
+        # Ciphertext scratch, reused for every record: AES-GCM adds a 16-byte
+        # tag, and headers are far smaller than a chunk.
+        self._ct = bytearray(chunk + TAG_SLACK) if self.encrypted else b""
+        self._ctview = memoryview(self._ct) if self.encrypted else None
+        self._len = bytearray(4)
 
     # -- records ----------------------------------------------------------
     def _send_record(self, data) -> None:
-        blob = self._sealer.seal(data)
-        self.sock.sendall(struct.pack("!I", len(blob)) + blob)
+        """Encrypt and frame one record.
 
-    def _recv_record(self) -> bytes:
+        The length prefix goes out as its own tiny write rather than being
+        concatenated with the ciphertext: joining them would copy the whole
+        multi-megabyte payload again for the sake of four bytes.
+        """
+        blob = self._sealer.seal(data)
+        struct.pack_into("!I", self._len, 0, len(blob))
+        self.sock.sendall(self._len)
+        self.sock.sendall(blob)
+
+    def _recv_record(self):
+        """Read one record into the reusable buffer and decrypt it."""
         (n,) = struct.unpack("!I", recv_exact(self.sock, 4))
         if n > MAX_RECORD:
             raise ProtocolError("record too large (%d bytes)" % n)
+        if n <= len(self._ct):
+            recv_into_exact(self.sock, self._ctview, n)
+            return self._opener.open(self._ctview[:n])
+        # Larger than our scratch (a peer with a bigger chunk size): fall back.
         return self._opener.open(recv_exact(self.sock, n))
 
     # -- headers ----------------------------------------------------------
@@ -220,7 +239,7 @@ class DataLink:
             if not got:
                 raise ProtocolError("unexpected end of local file")
             if self.encrypted:
-                self._send_record(bytes(view[:got]))
+                self._send_record(view[:got])
             else:
                 self.sock.sendall(view[:got])
             remaining -= got

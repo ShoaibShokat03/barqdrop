@@ -240,6 +240,37 @@ def decline_scenario(tmp):
         time.sleep(0.3)
 
 
+def speedtest_scenario(tmp):
+    """The speed test must move real bytes and write none of them."""
+    print(NL + "=== speed test ===")
+    a = Side(make_config(tmp, "snd-st", 46131))
+    b = Side(make_config(tmp, "rcv-st", 46132))
+    a.engine.start(discovery=False)
+    b.engine.start(discovery=False)
+    try:
+        size_mb = 128
+        start = time.time()
+        job_id = a.engine.speed_test({"name": "r", "ip": "127.0.0.1", "port": 46132}, size_mb)
+        job = a.wait_job(job_id, timeout=300)
+        elapsed = max(time.time() - start, 1e-6)
+        assert job["state"] == "done", "speed test failed: %s" % job["error"]
+        assert job["speedtest"], "job was not flagged as a speed test"
+        assert job["done"] >= size_mb << 20, (
+            "only %d of %d bytes were accounted for" % (job["done"], size_mb << 20))
+        assert not b.received, "a speed test must not report saved files"
+        inbox = b.cfg["save_dir"]
+        leftovers = os.listdir(inbox) if os.path.isdir(inbox) else []
+        assert not leftovers, "speed test wrote to disk: %s" % leftovers
+        print("  %s moved in %.2fs -> %s, nothing written to disk"
+              % (human_size(size_mb << 20), elapsed,
+                 human_rate((size_mb << 20) / elapsed)))
+        return True
+    finally:
+        a.close()
+        b.close()
+        time.sleep(0.3)
+
+
 def main() -> int:
     size_mb = int(sys.argv[1]) if len(sys.argv) > 1 else 128
     tmp = tempfile.mkdtemp(prefix="barqdrop-selftest-")
@@ -252,6 +283,7 @@ def main() -> int:
         ok &= scenario("resume", max(size_mb * 8, 512), tmp, True, 4, interrupt_at=0.25)
         ok &= folder_scenario(tmp)
         ok &= decline_scenario(tmp)
+        ok &= speedtest_scenario(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\nALL CHECKS PASSED" if ok else "\nFAILURES")

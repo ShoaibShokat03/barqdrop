@@ -37,7 +37,7 @@ from .protocol import (
     ROLE_CONTROL,
     ROLE_DATA,
 )
-from .resume import PartFile, split_ranges
+from .resume import NullPart, PartFile, split_ranges
 from .util import new_id, now, sanitize_relpath, unique_path
 
 CONNECT_TIMEOUT = 8.0
@@ -49,6 +49,34 @@ POLL = 0.5
 MAX_STREAMS = 16
 RETRY_LIMIT = 6
 RETRY_BACKOFF = 0.6
+
+
+class PatternSource:
+    """A file-like source of synthetic bytes, for the speed test.
+
+    Satisfies the same seek/readinto contract as a real file handle, so the
+    send path is byte-for-byte the one a real transfer takes.
+    """
+
+    __slots__ = ("_block",)
+
+    def __init__(self, block_size: int = 1 << 20):
+        self._block = bytes(range(256)) * (block_size // 256)
+
+    def seek(self, offset, whence=0):
+        return offset
+
+    def readinto(self, view) -> int:
+        want = len(view)
+        block, size, filled = self._block, len(self._block), 0
+        while filled < want:
+            take = min(size, want - filled)
+            view[filled:filled + take] = block[:take]
+            filled += take
+        return want
+
+    def close(self):
+        pass
 
 
 class TransferError(Exception):
@@ -98,6 +126,7 @@ class Job:
         self.state = "connecting"
         self.error = ""
         self.code = ""                      # pairing code while verifying
+        self.speedtest = False
         self.started = now()
         self.finished = 0.0
         self.cancel = threading.Event()
@@ -158,6 +187,7 @@ class Job:
             "error": self.error,
             "code": self.code,
             "files": len(self.files),
+            "speedtest": self.speedtest,
             "name": self.files[0]["rel"] if len(self.files) == 1 else "%d items" % len(self.files),
             "total": self.total,
             "done": min(done, self.total) if self.total else done,
@@ -170,8 +200,10 @@ class Job:
 class Offer:
     """An inbound request awaiting the user's yes/no."""
 
-    def __init__(self, peer_name, peer_ip, files, total, code, trusted, fingerprint):
+    def __init__(self, peer_name, peer_ip, files, total, code, trusted,
+                 fingerprint, speedtest=False):
         self.id = new_id()[:12]
+        self.speedtest = bool(speedtest)
         self.peer_name = peer_name
         self.peer_ip = peer_ip
         self.files = files
@@ -187,8 +219,9 @@ class Offer:
 class Session:
     """Receiver-side state shared between the control link and data links."""
 
-    def __init__(self, token, keys, encrypt, parts, files, job):
+    def __init__(self, token, keys, encrypt, parts, files, job, speedtest=False):
         self.token = token
+        self.speedtest = bool(speedtest)
         self.keys = keys
         self.encrypt = encrypt
         self.parts = parts          # index -> PartFile
@@ -340,8 +373,11 @@ class Engine:
                        "reason": "the file list was empty or malformed"})
             return
 
-        offer = Offer(peer_name, addr[0], files, total, keys.sas, trusted, fp)
-        auto = trusted and self.config.get("auto_accept_trusted", False)
+        speedtest = bool(msg.get("speedtest"))
+        offer = Offer(peer_name, addr[0], files, total, keys.sas, trusted, fp, speedtest)
+        # A speed test writes nothing to disk, so a paired device may run one
+        # without interrupting whoever is sitting at this machine.
+        auto = trusted and (speedtest or self.config.get("auto_accept_trusted", False))
         self.offers[offer.id] = offer
         if auto:
             offer.accepted = True
@@ -351,7 +387,7 @@ class Engine:
                 "id": offer.id, "peer": peer_name, "ip": addr[0],
                 "files": [{"rel": f["rel"], "size": f["size"]} for f in files][:200],
                 "count": len(files), "total": total,
-                "code": keys.sas, "trusted": trusted}})
+                "code": keys.sas, "trusted": trusted, "speedtest": speedtest}})
 
         if not offer.decided.wait(OFFER_TIMEOUT) or not offer.accepted:
             self.offers.pop(offer.id, None)
@@ -375,10 +411,12 @@ class Engine:
         save_dir = self.config["save_dir"]
         try:
             for f in files:
-                target = os.path.join(save_dir, os.path.normpath(f["rel"]))
-                part = PartFile(target, f["size"])
-                have = part.prepare()
-                resumed += have
+                if speedtest:
+                    part = NullPart(f["size"])
+                else:
+                    target = os.path.join(save_dir, os.path.normpath(f["rel"]))
+                    part = PartFile(target, f["size"])
+                resumed += part.prepare()
                 parts[f["index"]] = part
                 missing[str(f["index"])] = part.missing()
         except Exception as exc:
@@ -389,7 +427,7 @@ class Engine:
             return
 
         job.set_resumed(resumed)
-        session = Session(token, keys, encrypt, parts, files, job)
+        session = Session(token, keys, encrypt, parts, files, job, speedtest)
         with self._sessions_lock:
             self.sessions[token] = session
         if resumed:
@@ -458,6 +496,12 @@ class Engine:
             job.state = "failed"
             job.error = "Incomplete: %s (resend to resume)" % ", ".join(incomplete[:3])
             link.send({"t": MSG_RESULT, "ok": False, "error": job.error})
+            return
+        if session.speedtest:
+            session.parts = {}
+            job.state = "done"
+            job.finished = now()
+            link.send({"t": MSG_RESULT, "ok": True, "saved": 0})
             return
         saved = []
         try:
@@ -560,7 +604,18 @@ class Engine:
                          name="send", daemon=True).start()
         return job.id
 
-    def _send_worker(self, job: Job, peer: dict, items) -> None:
+    def speed_test(self, peer: dict, megabytes: int = 512):
+        """Measure the real link to `peer` with no disk on either end."""
+        size = max(16, int(megabytes)) << 20
+        items = [{"path": None, "rel": "Speed test", "size": size}]
+        job = Job("send", peer.get("name") or peer.get("ip", "?"), items, size)
+        job.speedtest = True
+        self._register(job)
+        threading.Thread(target=self._send_worker, args=(job, peer, items, True),
+                         name="speedtest", daemon=True).start()
+        return job.id
+
+    def _send_worker(self, job: Job, peer: dict, items, speedtest: bool = False) -> None:
         link = None
         try:
             try:
@@ -587,6 +642,7 @@ class Engine:
                 "t": MSG_OFFER,
                 "device": self.config["device_name"],
                 "encrypt": encrypt,
+                "speedtest": speedtest,
                 "files": [{"rel": i["rel"], "size": i["size"]} for i in items],
             })
 
@@ -758,7 +814,9 @@ class Engine:
                 index, offset, length = unit
                 fh = handles.get(index)
                 if fh is None:
-                    fh = handles[index] = open(items[index]["path"], "rb", buffering=0)
+                    path = items[index].get("path")
+                    fh = handles[index] = (open(path, "rb", buffering=0) if path
+                                           else PatternSource(chunk))
                 try:
                     job.set_inflight(stream_id, 0)
                     link.send_header(KIND_SEGMENT, index, offset, length)

@@ -187,3 +187,64 @@ class PartFile:
         """Keep the partial data on disk for a later resume."""
         self.close_handles()
         self.flush()
+
+
+class NullPart:
+    """A destination that accepts bytes and throws them away.
+
+    Used by the speed test: it exercises the exact network and crypto path a
+    real transfer uses, with no disk on either end, so the number it reports
+    is the link's ceiling rather than the storage's.
+    """
+
+    class _Sink:
+        __slots__ = ()
+
+        def seek(self, offset, whence=0):
+            return offset
+
+        def write(self, data):
+            return len(data)
+
+        def close(self):
+            pass
+
+    def __init__(self, size: int):
+        self.size = int(size)
+        self.final_path = ""
+        self._lock = threading.Lock()
+        self._received = 0
+
+    def prepare(self) -> int:
+        return 0
+
+    def open_handle(self):
+        return self._Sink()
+
+    def close_handles(self) -> None:
+        pass
+
+    def mark_done(self, offset: int, length: int) -> None:
+        with self._lock:
+            self._received += length
+
+    @property
+    def received(self) -> int:
+        with self._lock:
+            return self._received
+
+    def missing(self):
+        return [[0, self.size]] if self.size else []
+
+    def is_complete(self) -> bool:
+        with self._lock:
+            return self._received >= self.size
+
+    def flush(self) -> None:
+        pass
+
+    def finalize(self, unique):
+        return ""
+
+    def abandon(self) -> None:
+        pass

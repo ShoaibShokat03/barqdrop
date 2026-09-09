@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -65,6 +66,7 @@ def main() -> int:
     finally:
         a.close()
         b.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

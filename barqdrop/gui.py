@@ -22,6 +22,7 @@ from .link import DirectLink, cached_link_description
 from .util import human_eta, human_rate, human_size, primary_ip, resource_path
 
 APP_TITLE = "BarqDrop"
+SPEEDTEST_MB = 256      # generated payload for the link speed test
 
 
 # ------------------------------------------------------------------- icon
@@ -71,11 +72,12 @@ def _head(text: str) -> QLabel:
 class DeviceCard(QFrame):
     """One discovered peer; also a drop target for files."""
 
-    def __init__(self, peer: dict, on_send, on_drop):
+    def __init__(self, peer: dict, on_send, on_drop, on_speedtest=None):
         super().__init__()
         self.peer = peer
         self.on_send = on_send
         self.on_drop = on_drop
+        self.on_speedtest = on_speedtest
         self.setObjectName("Panel")
         self.setAcceptDrops(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -104,6 +106,16 @@ class DeviceCard(QFrame):
         col.addWidget(name)
         col.addWidget(sub)
         row.addLayout(col, 1)
+
+        if self.on_speedtest is not None:
+            self.speed_btn = QPushButton("Speed")
+            self.speed_btn.setObjectName("Ghost")
+            self.speed_btn.setCursor(Qt.PointingHandCursor)
+            self.speed_btn.setToolTip(
+                "Measure the real link to this device.\nSends generated data "
+                "that is discarded on arrival - nothing touches either disk.")
+            self.speed_btn.clicked.connect(lambda: self.on_speedtest(self.peer))
+            row.addWidget(self.speed_btn)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setObjectName("Primary")
@@ -210,8 +222,12 @@ class TransferRow(QFrame):
                 human_rate(job["rate"]), human_eta(job["eta"])))
         elif job["state"] == "done":
             elapsed = max(job["elapsed"], 0.001)
-            self.detail.setText("%s in %s  -  average %s" % (
-                human_size(total), human_eta(elapsed), human_rate(total / elapsed)))
+            summary = "%s in %s  -  average %s" % (
+                human_size(total), human_eta(elapsed), human_rate(total / elapsed))
+            if job.get("speedtest"):
+                mbps = (total / elapsed) * 8 / 1_000_000
+                summary += "   (%.0f Mbps link)" % mbps
+            self.detail.setText(summary)
         elif job["error"]:
             self.detail.setText(job["error"])
         else:
@@ -651,6 +667,9 @@ class MainWindow(QMainWindow):
     def _drop_on_device(self, peer: dict, paths) -> None:
         self.engine.send_paths(peer, paths)
 
+    def _speed_test(self, peer: dict) -> None:
+        self.engine.speed_test(peer, SPEEDTEST_MB)
+
     # ------------------------------------------------------------ devices
     def _refresh_devices(self) -> None:
         peers = self.engine.discovery.snapshot()
@@ -665,7 +684,8 @@ class MainWindow(QMainWindow):
             self.empty_hint.show()
             return
         for i, peer in enumerate(peers):
-            card = DeviceCard(peer, self._send_to, self._drop_on_device)
+            card = DeviceCard(peer, self._send_to, self._drop_on_device,
+                              self._speed_test)
             self.device_lay.insertWidget(i, card)
 
     # ------------------------------------------------------------- status
